@@ -1476,7 +1476,7 @@ PAGE = r"""<!doctype html>
             <section class="queue-wrap" id="playlist-wrap" hidden><p class="queue-note"><strong>Playlist delivery:</strong> a quality ceiling is selected for every item, then the available files return in one ZIP.</p><div class="queue" id="queue-preview" aria-label="Playlist items"></div></section>
           </div>
           <!-- Replace this href with the real repository URL when the project is published. -->
-          <a class="project-link project-link--source" href="https://github.com/Code_Leafy/Hydro" target="_blank" rel="noreferrer"><span>GitHub project</span><b>Set link later ↗</b></a>
+          <a class="project-link project-link--source" href="https://github.com/Code_Leafy/Hydro" target="_blank" rel="noreferrer"><span>GitHub project</span><b>Code-Leafy ↗</b></a>
         </div>
       </aside>
 
