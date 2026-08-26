@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import atexit
 from html.parser import HTMLParser
-import importlib.util
 import ipaddress
 import mimetypes
 import json
@@ -40,8 +39,15 @@ for _stale_proxy_name in ("request", "session", "g", "current_app"):
 
 APP_NAME = "Hydro"
 DEFAULT_PORT = 5000
-TEMP_ROOT = Path(tempfile.gettempdir()) / "signal-shelf"
-INSTANCE_FILE = Path(tempfile.gettempdir()) / "signal-shelf-colab-instance.json"
+
+
+def _scratch_root() -> Path:
+    override = os.environ.get("SIGNAL_TEMP_DIR")
+    return Path(override) if override else Path(tempfile.gettempdir())
+
+
+TEMP_ROOT = _scratch_root() / "signal-shelf"
+INSTANCE_FILE = _scratch_root() / "signal-shelf-colab-instance.json"
 MAX_COOKIE_BYTES = 2 * 1024 * 1024
 INSPECTION_TTL = 20 * 60
 JOB_TTL = 45 * 60
@@ -162,11 +168,6 @@ def cleanup_previous_instance(port: int) -> None:
         if is_matching_tunnel or is_old_launcher:
             stop_process(pid)
 
-cleanup_previous_instance(requested_port())
-
-shutil.rmtree(TEMP_ROOT, ignore_errors=True)
-TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-
 def run_quiet(command: list[str], task: str) -> None:
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if result.returncode:
@@ -217,13 +218,30 @@ def cloudflared_path() -> str:
             raise RuntimeError("Could not download the free Cloudflare tunnel helper from GitHub.") from exc
     return str(binary)
 
-FFMPEG_READY = ensure_dependencies()
-clear_colab_output()
+def prepare_runtime() -> None:
 
-from flask import Flask, Response, jsonify, send_file, stream_with_context
+    global FFMPEG_READY
+    cleanup_previous_instance(requested_port())
+    shutil.rmtree(TEMP_ROOT, ignore_errors=True)
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    (TEMP_ROOT / "inspections").mkdir(exist_ok=True)
+    (TEMP_ROOT / "jobs").mkdir(exist_ok=True)
+    FFMPEG_READY = ensure_dependencies()
+    clear_colab_output()
+
+
+FFMPEG_READY: bool = False
+
+try:
+    from flask import Flask, Response, jsonify, send_file, stream_with_context
+    import yt_dlp
+except ImportError:
+    ensure_dependencies()
+    from flask import Flask, Response, jsonify, send_file, stream_with_context
+    import yt_dlp
+
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.serving import WSGIRequestHandler, make_server
-import yt_dlp
 
 class APIError(Exception):
     def __init__(self, message: str, status: int = 400):
@@ -404,8 +422,6 @@ class TransferStore:
         for job in old_jobs:
             shutil.rmtree(job.directory, ignore_errors=True)
 
-(TEMP_ROOT / "inspections").mkdir(exist_ok=True)
-(TEMP_ROOT / "jobs").mkdir(exist_ok=True)
 store = TransferStore()
 
 def cleanup_worker() -> None:
@@ -554,6 +570,10 @@ def platform_oembed_image_info(page_url: str) -> dict[str, Any] | None:
         image_url = data.get("thumbnail_url") or data.get("image")
         if not isinstance(image_url, str) or not image_url.startswith(("http://", "https://")):
             return None
+        try:
+            validate_remote_fetch_url(image_url)
+        except APIError:
+            return None
         title = clean_short_text(data.get("title") or "Public preview image", 180)
         author = clean_short_text(data.get("author_name") or host, 120)
         extension = image_extension(image_url)
@@ -614,6 +634,10 @@ def public_preview_image_info(page_url: str) -> dict[str, Any] | None:
         parsed = urlparse(image_url)
         if parsed.scheme not in {"http", "https"}:
             return None
+        try:
+            validate_remote_fetch_url(image_url)
+        except APIError:
+            return None
         extension = image_extension(image_url, content_type if 'content_type' in locals() else None)
         host = urlparse(page_url).hostname or "Public page"
         return {
@@ -650,6 +674,22 @@ def validate_source_url(raw: Any) -> str:
         address = ipaddress.ip_address(host)
         if not address.is_global:
             raise APIError("Private-network addresses are not accepted.")
+    except ValueError:
+        pass
+    return url
+
+def validate_remote_fetch_url(raw: Any) -> str:
+    url = str(raw or "").strip()
+    if not url:
+        raise APIError("That remote URL is missing.", 400)
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise APIError("That remote URL is not supported.", 400)
+    host = (parsed.hostname or "").rstrip(".").lower()
+    try:
+        address = ipaddress.ip_address(host)
+        if not address.is_global:
+            raise APIError("Remote private-network addresses are not accepted.", 400)
     except ValueError:
         pass
     return url
@@ -848,12 +888,12 @@ def friendly_error(error: Exception, action: str) -> str:
         return "No downloadable stream was exposed by this page. Hydro can use a public page-preview image when one is available, but protected media needs access from the source."
     if "unsupported url" in message:
         return "This link is not supported by the installed downloader. Try the canonical media-page link."
+    if "requested format is not available" in message:
+        return "That source rendition changed. Read the link again, then choose a currently listed path."
     if "not available" in message or "unavailable" in message:
         return "This media is unavailable at the source. Check the link or choose another item."
     if "ffmpeg" in message:
         return "FFmpeg is needed for this merge or conversion. Re-run in a Colab runtime where setup completed."
-    if "requested format is not available" in message:
-        return "That source rendition changed. Read the link again, then choose a currently listed path."
     return f"Could not {action}. Check the link and try again."
 
 def is_playlist_info(info: dict[str, Any]) -> bool:
@@ -1000,6 +1040,10 @@ def download_public_image(job: DownloadJob, inspection: Inspection) -> Path:
     image_url = inspection.direct_media_url
     if not image_url:
         raise RuntimeError("No direct public image URL is available.")
+    try:
+        image_url = validate_remote_fetch_url(image_url)
+    except APIError:
+        raise RuntimeError("The source image URL is not reachable from this runtime.") from None
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
         "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
@@ -1056,7 +1100,11 @@ def run_download(job_id: str) -> None:
         store.update_job(job_id, status="running", stage="Opening the selected source path", progress=0)
         is_playlist = inspection.source_type == "playlist"
 
+        last_hook_update = 0.0
+        last_hook_progress: float | None = None
+
         def progress_hook(event: dict[str, Any]) -> None:
+            nonlocal last_hook_update, last_hook_progress
             status = event.get("status")
             info = event.get("info_dict") if isinstance(event.get("info_dict"), dict) else {}
             item_index = as_int(info.get("playlist_index")) if is_playlist else None
@@ -1074,6 +1122,13 @@ def run_download(job_id: str) -> None:
                 else:
                     overall = item_progress
                     stage = "Downloading source"
+                now = time.monotonic()
+                moved = abs((overall or 0.0) - (last_hook_progress or 0.0))
+                throttled = overall is not None and moved < 1.0 and now - last_hook_update < 1.0
+                if throttled:
+                    return
+                last_hook_update = now
+                last_hook_progress = overall
                 store.update_job(
                     job_id,
                     stage=stage,
@@ -1204,6 +1259,7 @@ PAGE = r"""<!doctype html>
     :focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
     .skip { position: fixed; z-index: 50; top: -50px; left: 12px; padding: 8px 10px; color: var(--canvas); background: var(--gold); font: 700 11px var(--mono); text-decoration: none; }
     .skip:focus { top: 12px; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
     /* Desktop is a bounded application shell: panes, not a scrolling document. */
     .app { height: 100vh; height: 100dvh; display: grid; grid-template-rows: 62px minmax(0, 1fr); }
@@ -1291,7 +1347,7 @@ PAGE = r"""<!doctype html>
     .table-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; min-height: 31px; align-items: center; padding: 0 15px; border-bottom: 1px solid var(--line); color: var(--faint); font: 700 8px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
     .table-head span:last-child { text-align: right; }
     .format-list { flex: 1; min-height: 0; overflow-y: auto; scrollbar-color: var(--line-strong) var(--panel); }
-    .format-folder { border-bottom: 1px solid var(--line); animation: folder-in .24s ease both; animation-delay: calc(var(--folder-index, 0) * 28ms); }
+    .format-folder { border-bottom: 1px solid var(--line); animation: folder-in .24s ease both; animation-delay: calc(min(var(--folder-index, 0), 12) * 28ms); }
     @keyframes folder-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
     .folder-toggle { width: 100%; display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 35px; padding: 0 15px; border: 0; color: var(--soft); background: var(--panel-2); text-align: left; }
     .folder-toggle:hover { background: var(--panel-3); }
@@ -1302,7 +1358,7 @@ PAGE = r"""<!doctype html>
     .folder-title { overflow: hidden; font: 900 10px/1 var(--mono); letter-spacing: .06em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
     .folder-count { color: var(--faint); font: 800 8px/1 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
     .folder-content { background: var(--panel); }
-    .format-row { width: 100%; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 11px 15px; border: 0; border-bottom: 1px solid var(--line); color: var(--text); background: transparent; text-align: left; transition: background .15s ease, box-shadow .15s ease; }
+    .format-row { width: 100%; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 11px 15px; border: 0; border-bottom: 1px solid var(--line); color: var(--text); background: transparent; text-align: left; transition: background .15s ease, box-shadow .15s ease; content-visibility: auto; contain-intrinsic-size: auto 50px; }
     .format-row:last-child { border-bottom: 0; }
     .format-row:hover { background: var(--panel-2); }
     .format-row[aria-pressed="true"] { background: var(--accent-wash); box-shadow: inset 2px 0 0 var(--accent); }
@@ -1405,14 +1461,14 @@ PAGE = r"""<!doctype html>
   <div class="app">
     <header class="appbar">
       <a class="brand" href="/" aria-label="Hydro — Universal Media Download Colab home"><svg class="brand-icon" viewBox="0 0 44 44" fill="none" aria-hidden="true"><path d="M22 3.5C17.9 10.3 8.5 18.2 8.5 27.1A13.5 13.5 0 0 0 35.5 27.1C35.5 18.2 26.1 10.3 22 3.5Z" fill="currentColor"/><path d="M22 14.5v12m-4.5-4 4.5 4 4.5-4M15.5 32h13" stroke="#000" stroke-width="2.2" stroke-linecap="square" stroke-linejoin="miter"/></svg><span class="brand-word"><b>Hydro</b><small>Universal Media Colab</small></span></a>
-      <form class="read-form" id="source-form" novalidate><div class="input-strip"><span class="input-glyph" aria-hidden="true">⌁</span><input id="source-url" type="url" inputmode="url" autocomplete="url" placeholder="YouTube, Instagram, X, Pinterest, Reddit, or a direct media link…" required><button class="read" id="read-button" type="submit">Inspect link</button></div></form>
+      <form class="read-form" id="source-form" novalidate><label class="visually-hidden" for="source-url">Media link to inspect</label><div class="input-strip"><span class="input-glyph" aria-hidden="true">⌁</span><input id="source-url" type="url" inputmode="url" autocomplete="url" placeholder="YouTube, Instagram, X, Pinterest, Reddit, or a direct media link…" required><button class="read" id="read-button" type="submit">Inspect link</button></div></form>
       <div class="header-tools"><details class="session"><summary>Session</summary><div class="session-popover"><p>Optional only. Public links work without a cookie file. Use your own cookies.txt only when a source asks for signed-in access.</p><label class="session-file"><input id="cookie-file" type="file" accept=".txt,text/plain"><output id="cookie-name">No file</output></label></div></details></div>
     </header>
 
     <main class="workspace" aria-label="Media format application">
       <aside class="pane source-pane" aria-label="Selected source preview and details">
         <div class="source-scroll">
-          <div class="monitor" id="monitor"><div class="monitor-empty" id="monitor-empty"><svg class="empty-icon" viewBox="0 0 44 44" fill="none" aria-hidden="true"><path d="M22 3.5C17.9 10.3 8.5 18.2 8.5 27.1A13.5 13.5 0 0 0 35.5 27.1C35.5 18.2 26.1 10.3 22 3.5Z" fill="currentColor"/><path d="M22 14.5v12m-4.5-4 4.5 4 4.5-4M15.5 32h13" stroke="#000" stroke-width="2.2" stroke-linecap="square" stroke-linejoin="miter"/></svg><span>Preview appears here</span></div><img id="source-thumbnail" alt="Source preview thumbnail" hidden><span class="monitor-tag" id="monitor-tag" hidden>Source preview</span></div>
+          <div class="monitor" id="monitor"><div class="monitor-empty" id="monitor-empty"><svg class="empty-icon" viewBox="0 0 44 44" fill="none" aria-hidden="true"><path d="M22 3.5C17.9 10.3 8.5 18.2 8.5 27.1A13.5 13.5 0 0 0 35.5 27.1C35.5 18.2 26.1 10.3 22 3.5Z" fill="currentColor"/><path d="M22 14.5v12m-4.5-4 4.5 4 4.5-4M15.5 32h13" stroke="#000" stroke-width="2.2" stroke-linecap="square" stroke-linejoin="miter"/></svg><span>Preview appears here</span></div><img id="source-thumbnail" alt="Source preview thumbnail" decoding="async" fetchpriority="high" hidden><span class="monitor-tag" id="monitor-tag" hidden>Source preview</span></div>
           <div class="source-copy">
             <h1 id="source-title">No source loaded</h1>
             <p id="source-byline">Inspect a link to see its preview, publisher, runtime, and available source paths.</p>
@@ -1428,9 +1484,9 @@ PAGE = r"""<!doctype html>
         <div class="empty-catalog" id="catalog-empty"><div class="empty-catalog-inner"><div class="empty-ruler" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div><h2>Inspect first.<br>Choose exactly.</h2><p>Paste a public media link above. This app inspects the source before it downloads anything.</p></div></div>
         <div id="catalog-content" hidden>
           <div class="catalog-head"><div><h2 id="catalog-title">Source paths</h2><p id="catalog-mode">Exact formats reported by the source</p></div><span class="catalog-count" id="catalog-count">—</span></div>
-          <div class="tabs" role="tablist" aria-label="Format type"><button class="tab" id="tab-video" type="button" role="tab" aria-selected="true">Video <span id="video-count">0</span></button><button class="tab" id="tab-audio" type="button" role="tab" aria-selected="false">Audio <span id="audio-count">0</span></button><button class="tab" id="tab-image" type="button" role="tab" aria-selected="false">Image <span id="image-count">0</span></button></div>
+          <div class="tabs" role="tablist" aria-label="Format type"><button class="tab" id="tab-video" type="button" role="tab" aria-controls="format-list" aria-selected="true">Video <span id="video-count">0</span></button><button class="tab" id="tab-audio" type="button" role="tab" aria-controls="format-list" aria-selected="false">Audio <span id="audio-count">0</span></button><button class="tab" id="tab-image" type="button" role="tab" aria-controls="format-list" aria-selected="false">Image <span id="image-count">0</span></button></div>
           <div class="table-head"><span id="table-label">Available video formats</span><span id="table-note">Source size</span></div>
-          <div class="format-list" id="format-list" role="group" aria-label="Available source formats"></div>
+          <div class="format-list" id="format-list" role="tabpanel" aria-labelledby="tab-video" aria-label="Available source formats"></div>
         </div>
       </section>
 
@@ -1593,7 +1649,8 @@ PAGE = r"""<!doctype html>
     }
     function updateTabs() {
       const kinds = ['video', 'audio', 'image'];
-      kinds.forEach((kind) => { const total = items(kind).length; setText(`#${kind}-count`, String(total)); const tab = $(`#tab-${kind}`); tab.disabled = total === 0; tab.setAttribute('aria-selected', String(state.active === kind)); });
+      kinds.forEach((kind) => { const total = items(kind).length; setText(`#${kind}-count`, String(total)); const tab = $(`#tab-${kind}`); tab.disabled = total === 0; tab.setAttribute('aria-selected', String(state.active === kind)); tab.tabIndex = state.active === kind ? 0 : -1; });
+      const panel = $('#format-list'); if (panel) panel.setAttribute('aria-labelledby', `tab-${state.active}`);
     }
     function updateExport() {
       const kind = state.active; const item = chosen(kind); if (!item) { $('#export-empty').hidden = false; $('#export-content').hidden = true; $('#export-button').disabled = true; return; }
@@ -1628,6 +1685,19 @@ PAGE = r"""<!doctype html>
       finally { setReading(false); }
     });
     $('#tab-video').addEventListener('click', () => activate('video')); $('#tab-audio').addEventListener('click', () => activate('audio')); $('#tab-image').addEventListener('click', () => activate('image'));
+    const tabButtons = ['video', 'audio', 'image'].map((kind) => $(`#tab-${kind}`));
+    function tabKeydown(event) {
+      const enabled = tabButtons.filter((tab) => !tab.disabled);
+      const index = enabled.indexOf(document.activeElement);
+      if (index === -1) return;
+      let next = null;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = enabled[(index + 1) % enabled.length];
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = enabled[(index - 1 + enabled.length) % enabled.length];
+      else if (event.key === 'Home') next = enabled[0];
+      else if (event.key === 'End') next = enabled[enabled.length - 1];
+      if (next) { event.preventDefault(); activate(next.id.replace('tab-', '')); next.focus(); }
+    }
+    tabButtons.forEach((tab) => tab.addEventListener('keydown', tabKeydown));
     $('#cookie-file').addEventListener('change', () => setText('#cookie-name', $('#cookie-file').files[0] ? $('#cookie-file').files[0].name : 'No file'));
 
     function updateTransfer(job) {
@@ -1660,7 +1730,7 @@ PAGE = r"""<!doctype html>
       const last = state.progressQueue[state.progressQueue.length - 1];
       const moved = last && last.progress !== null && last.progress !== undefined && job.progress !== null && job.progress !== undefined ? Math.abs(job.progress - last.progress) : 99;
       if (last && !terminal && last.status !== 'complete' && last.status !== 'failed' && last.stage === job.stage && moved < 8) state.progressQueue[state.progressQueue.length - 1] = job;
-      else if (!last || last.revision !== job.revision) state.progressQueue.push(job);
+      else if (!last || last.revision !== job.revision) { if (state.progressQueue.length >= 48 && !terminal) state.progressQueue[state.progressQueue.length - 1] = job; else state.progressQueue.push(job); }
       if (!state.progressPlaying) playProgressQueue();
     }
     function follow(jobId) {
@@ -1668,6 +1738,9 @@ PAGE = r"""<!doctype html>
       const source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/events`); state.eventSource = source;
       source.addEventListener('progress', (event) => queueTransferUpdate(JSON.parse(event.data)));
       source.addEventListener('done', (event) => queueTransferUpdate(JSON.parse(event.data)));
+      const releaseSource = () => { if (state.eventSource === source) { state.eventSource = null; source.close(); } $('#export-button').disabled = false; };
+      source.addEventListener('closed', releaseSource);
+      source.onerror = () => { if (source.readyState === EventSource.CLOSED) releaseSource(); };
     }
     async function beginExport() {
       const kind = state.active; const item = chosen(kind); if (!state.token || !item) { showError('Choose a source path first.'); return; }
@@ -1715,9 +1788,11 @@ def inspection_thumbnail(token: str) -> Response:
     remote_url = inspection.thumbnail_url if inspection else None
     if not remote_url:
         raise APIError("That preview is unavailable or its source catalog expired.", 404)
+    try:
+        remote_url = validate_remote_fetch_url(remote_url)
+    except APIError:
+        raise APIError("That preview is unavailable or its source catalog expired.", 404) from None
     parsed = urlparse(remote_url)
-    if parsed.scheme not in {"http", "https"}:
-        raise APIError("That preview URL is not supported.", 400)
     try:
         request_object = urllib.request.Request(
             remote_url,
@@ -1932,6 +2007,11 @@ def job_events(job_id: str) -> Response:
     def events() -> Any:
 
         last_revision = 0
+        terminal_at_open = False
+        with store.changed:
+            opening_job = store.jobs.get(job_id)
+            if opening_job:
+                terminal_at_open = opening_job.status in {"complete", "failed"}
         while True:
             heartbeat = False
             with store.changed:
@@ -1944,6 +2024,8 @@ def job_events(job_id: str) -> Response:
                     pending = [(revision, snapshot) for revision, snapshot in job.history if revision > last_revision]
                     terminal = job.status in {"complete", "failed"}
                     missing = False
+                    if terminal_at_open:
+                        pending = pending[-1:] if pending else []
                     if not pending and not terminal:
                         heartbeat = not store.changed.wait(timeout=12)
             if missing:
@@ -2136,6 +2218,7 @@ def main() -> None:
     parser.add_argument("--no-tunnel", action="store_true", help="Run Flask only for local troubleshooting.")
 
     args, _kernel_args = parser.parse_known_args()
+    prepare_runtime()
     print(f"{APP_NAME} · starting free Colab runtime (FFmpeg: {'ready' if FFMPEG_READY else 'unavailable'})", flush=True)
     active_port = start_server(args.port)
     OWN_PORT = active_port
